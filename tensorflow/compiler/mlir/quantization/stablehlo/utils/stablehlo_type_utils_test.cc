@@ -16,24 +16,41 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/quantization/stablehlo/utils/stablehlo_type_utils.h"
 
 #include <gtest/gtest.h>
+#include "mlir/Dialect/Arith/IR/Arith.h"  // from @llvm-project
 #include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
 #include "mlir/IR/MLIRContext.h"  // from @llvm-project
+#include "mlir/IR/OwningOpRef.h"  // from @llvm-project
 #include "stablehlo/dialect/StablehloOps.h"  // from @stablehlo
 
 namespace mlir::quant::stablehlo {
 namespace {
 
-TEST(UtilsTest, IsStablehloOp) {
-  MLIRContext ctx;
-  OpBuilder b(&ctx);
-  ctx.loadDialect<mlir::stablehlo::StablehloDialect, mlir::func::FuncDialect>();
+using ::testing::Test;
 
-  mlir::stablehlo::ConstantOp constant_op =
-      b.create<mlir::stablehlo::ConstantOp>(b.getUnknownLoc(),
-                                            b.getI32IntegerAttr(0));
-  EXPECT_TRUE(IsStablehloOp(constant_op));
-  constant_op->erase();
+class StablehloTypeUtilsTest : public Test {
+ protected:
+  StablehloTypeUtilsTest() {
+    ctx_.loadDialect<mlir::stablehlo::StablehloDialect,
+                     mlir::arith::ArithDialect, mlir::func::FuncDialect>();
+  }
+
+  MLIRContext ctx_;
+  OpBuilder builder_{&ctx_};
+};
+
+TEST_F(StablehloTypeUtilsTest, IsStablehloOpSucceedsWithStablehloOp) {
+  const OwningOpRef<mlir::stablehlo::ConstantOp> constant_op =
+      builder_.create<mlir::stablehlo::ConstantOp>(
+          builder_.getUnknownLoc(), builder_.getI32IntegerAttr(0));
+  EXPECT_TRUE(IsStablehloOp(*constant_op));
+}
+
+TEST_F(StablehloTypeUtilsTest, IsStablehloOpFailsWithArithOp) {
+  const OwningOpRef<mlir::arith::ConstantOp> constant_op =
+      builder_.create<mlir::arith::ConstantOp>(builder_.getUnknownLoc(),
+                                               builder_.getI32IntegerAttr(0));
+  EXPECT_FALSE(IsStablehloOp(*constant_op));
 }
 
 }  // namespace

@@ -64,7 +64,7 @@ namespace {
 // enable logging.
 constexpr char kBridgeComponent[] = "TFXLABridge";
 
-void CreateTPUBridgePipelineV1(OpPassManager &pm) {
+void CreateReplicatedBridgePipelineV1(OpPassManager &pm) {
   pm.addPass(mlir::tf2xla::internal::CreateInferenceMetricsPass());
 
   // Convert to unified compilation and replication attributes.
@@ -103,6 +103,7 @@ tensorflow::Status RunTFXLABridge(
   }
 
   PassManager bridge(module.getContext());
+  bridge.enableVerifier();
   ::tensorflow::applyTensorflowAndCLOptions(bridge);
 
   // Populate a passmanager with the list of passes that implement the bridge.
@@ -175,7 +176,7 @@ absl::Status RunClusteringPipelineOnSubmodule(
     clustering_pipeline_status = RunTFXLABridge(
         submodule,
         [](OpPassManager &pm) {
-          internal::AddBridgeClusteringPipelinePasses(pm);
+          internal::AddReplicatedBridgeClusteringPipelinePasses(pm);
         },
         /*module_name=*/"", /*dump_prefix=*/"tf_xla_clustering_bridge_v1");
     if (num_submodules > 1) {
@@ -202,34 +203,6 @@ absl::Status RunClusteringPipelineOnSubmodule(
   return absl::OkStatus();
 }
 
-absl::Status RunLowerToRuntimeOpsOnSubmodule(ModuleOp parent_module,
-                                             bool is_in_fallback_enabled_mode) {
-  int num_submodules = 0;
-  absl::Status runtime_lowering_status;
-  parent_module.walk([&](ModuleOp submodule) {
-    if (submodule == parent_module) return mlir::WalkResult::advance();
-    num_submodules++;
-    runtime_lowering_status =
-        tensorflow::tfrt_compiler::RunLowerClusterToRuntimeOpsPassPipeline(
-            submodule, tsl::DeviceType(DEVICE_TPU_XLA_JIT));
-    if (num_submodules > 1) {
-      return mlir::WalkResult::interrupt();
-    }
-
-    return mlir::WalkResult::advance();
-  });
-
-  if (num_submodules > 1) {
-    auto num_submodules_error = absl::InternalError(
-        "Lower to runtime has more than one submodule. Erroring out.");
-    TF_RETURN_IF_ERROR(RecordStatusIfError(
-        /*error_prefix=*/"V1 Lowering to runtime has more than one submodule:",
-        is_in_fallback_enabled_mode, num_submodules_error));
-  }
-
-  return absl::OkStatus();
-}
-
 tensorflow::Status RunSessionTf2xlaClusteringBridge(
     ModuleOp module, bool is_in_fallback_enabled_mode) {
   VLOG(2) << "TPU Sessions Bridge called stack trace is "
@@ -238,7 +211,7 @@ tensorflow::Status RunSessionTf2xlaClusteringBridge(
           << tensorflow::CurrentStackTrace();
 
   Status functional_import_status = RunTFXLABridge(
-      module, [](OpPassManager &pm) { CreateTPUBridgePipelineV1(pm); },
+      module, [](OpPassManager &pm) { CreateReplicatedBridgePipelineV1(pm); },
       /*module_name=*/"", /*dump_prefix=*/"tf_xla_functional_import_bridge_v1");
   TF_RETURN_IF_ERROR(RecordStatusIfError(
       /*error_prefix=*/"Bridge Function Import V1", is_in_fallback_enabled_mode,
@@ -247,23 +220,20 @@ tensorflow::Status RunSessionTf2xlaClusteringBridge(
   TF_RETURN_IF_ERROR(
       RunClusteringPipelineOnSubmodule(module, is_in_fallback_enabled_mode));
 
-  TF_RETURN_IF_ERROR(
-      RunLowerToRuntimeOpsOnSubmodule(module, is_in_fallback_enabled_mode));
-
   tensorflow::metrics::UpdateTfMlirBridgeFirstPhaseCounter(
       /*device_type=*/"tpu", /*bridge_version=*/"v1",
       /*n_fallback_enabled*/ is_in_fallback_enabled_mode,
       /*result=*/"success");
 
-  return tensorflow::tf2xla::v1::ExportFromTensorflowDialectToExecutor(module);
+  return absl::OkStatus();
 }
 
 // Registers a pipeline builder function for TF TPU V1 bridge.
-mlir::PassPipelineRegistration<> tpu_pipeline_v1(
-    "tf-cluster-tpu-bridge-v1",
+mlir::PassPipelineRegistration<> replicated_clustering_bridge_v1(
+    "tf-replicated-clustering-bridge-v1",
     "Run all the passes involved in transforming a TensorFlow V1 graph before "
-    "execution so that it is suitable for targeting TPUs.",
-    CreateTPUBridgePipelineV1);
+    "execution so that it is suitable for targeting devices.",
+    CreateReplicatedBridgePipelineV1);
 
 }  // namespace v1
 }  // namespace tf2xla

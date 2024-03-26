@@ -1,4 +1,4 @@
-/* Copyright 2023 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2023 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,24 +32,15 @@ Status VerifyS4U4Usage(HloInstruction* instruction) {
   switch (instruction->opcode()) {
     case HloOpcode::kBitcast:
     case HloOpcode::kConstant:
+    case HloOpcode::kConcatenate:
     case HloOpcode::kConvert:
     case HloOpcode::kCopy:
     case HloOpcode::kFusion:
     case HloOpcode::kGetTupleElement:
     case HloOpcode::kParameter:
+    case HloOpcode::kSlice:
     case HloOpcode::kTuple:
-      TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
-          instruction->shape(), [&](const Shape& shape, const ShapeIndex&) {
-            if (primitive_util::Is4BitType(shape.element_type()) &&
-                ShapeUtil::ElementsIn(shape) % 2 == 1) {
-              return absl::InvalidArgumentError(absl::StrFormat(
-                  "S4/U4 arrays must have an even number of elements, but got "
-                  "instruction with S4/U4 input with odd number of elements: "
-                  "%s",
-                  instruction->ToString()));
-            }
-            return OkStatus();
-          }));
+    case HloOpcode::kWhile:
       break;
     default:
       TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(

@@ -1,4 +1,4 @@
-/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2021 The OpenXLA Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -171,7 +171,7 @@ bool MatchOperandsToAllReduceWithOptionalConvert(HloInstruction* inst,
 }
 }  // namespace
 
-StatusOr<bool> AllReduceReassociate::Run(
+absl::StatusOr<bool> AllReduceReassociate::Run(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   if (hlo_query::ContainsLayoutConstrainedAllReduce(*module)) {
@@ -214,7 +214,10 @@ StatusOr<bool> AllReduceReassociate::Run(
       if (!inst->shape().IsArray()) {
         continue;
       }
-      if (lhs->opcode() != rhs->opcode()) {
+      if (lhs->opcode() != rhs->opcode() ||
+          (lhs->opcode() == HloOpcode::kDynamicSlice &&
+           !ShapeUtil::Compatible(lhs->operand(0)->shape(),
+                                  rhs->operand(0)->shape()))) {
         continue;
       }
       HloAllReduceInstruction* ar0 = nullptr;
@@ -278,8 +281,8 @@ StatusOr<bool> AllReduceReassociate::Run(
         continue;
       }
       VLOG(2) << "Reassociated:";
-      VLOG(2) << "\tAR0: " << ar0->opcode();
-      VLOG(2) << "\tAR1: " << ar1->opcode();
+      VLOG(2) << "\tAR0: " << ar0->ToString();
+      VLOG(2) << "\tAR1: " << ar1->ToString();
 
       auto op_users = inst->users();
       // Found pattern op(ar(x), ar(y)). Transform it into ar(op(x,y)).

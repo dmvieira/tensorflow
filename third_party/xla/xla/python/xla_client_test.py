@@ -1,4 +1,4 @@
-# Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+# Copyright 2017 The OpenXLA Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -82,6 +82,8 @@ FLAGS = flags.FLAGS
 # use widely for parameterizing tests.
 # pylint: disable=g-complex-comprehension
 
+_CUSTOM_CALLS_REGISTERED = False
+
 
 def TestFactory(xla_backend,
                 cloud_tpu=False,
@@ -108,6 +110,12 @@ def TestFactory(xla_backend,
     def setUp(self):
       super(ComputationTest, self).setUp()
       self.backend = xla_backend()
+
+      global _CUSTOM_CALLS_REGISTERED
+      if self.backend.platform == "cpu" and not _CUSTOM_CALLS_REGISTERED:
+        for name, fn in custom_call_for_test.cpu_custom_call_targets.items():
+          xla_client.register_custom_call_target(name, fn, platform="cpu")
+        _CUSTOM_CALLS_REGISTERED = True
 
     def _NewComputation(self, name=None):
       if name is None:
@@ -210,7 +218,8 @@ def TestFactory(xla_backend,
         self.assertEqual(computation.as_serialized_hlo_module_proto(), ref)
 
     # TODO(b/261771737): some version of this should work with pjrt_c_api=True
-    @unittest.skipIf(cloud_tpu or pathways or pjrt_c_api, "not implemented")
+    @unittest.skipIf(cloud_tpu or pathways or pathways_ifrt or pjrt_c_api,
+                     "not implemented")
     def testFlopEstimate(self):
       computation = self.ExampleComputation()
       properties = xla_client._xla.hlo_module_cost_analysis(
@@ -222,7 +231,9 @@ def TestFactory(xla_backend,
       executable = self.backend.compile(
           xla_computation_to_mlir_module(computation))
       fingerprint = executable.fingerprint
-      if self.backend.platform == "tpu" and not (cloud_tpu or pathways):
+      if (
+          self.backend.platform == "tpu" or self.backend.platform == "gpu"
+      ) and not (cloud_tpu or pathways or pathways_ifrt):
         logging.info("fingerprint: %s", fingerprint)
         self.assertNotEmpty(fingerprint)
       else:
@@ -400,8 +411,6 @@ def TestFactory(xla_backend,
       if self.backend.platform != "cpu":
         self.skipTest("Test requires cpu platform")
       c = self._NewComputation()
-      for name, fn in custom_call_for_test.cpu_custom_call_targets.items():
-        xla_client.register_custom_call_target(name, fn, platform="cpu")
       ops.CustomCallWithLayout(
           c,
           b"test_subtract_f32",
@@ -423,8 +432,6 @@ def TestFactory(xla_backend,
       if self.backend.platform != "cpu":
         self.skipTest("Test requires cpu platform")
       c = self._NewComputation()
-      for name, fn in custom_call_for_test.cpu_custom_call_targets.items():
-        xla_client.register_custom_call_target(name, fn, platform="cpu")
 
       opaque_str = b"foo"
       ops.CustomCallWithLayout(
@@ -445,6 +452,22 @@ def TestFactory(xla_backend,
           api_version=xla_client.ops.CustomCallApiVersion
           .API_VERSION_STATUS_RETURNING_UNIFIED)
       self._ExecuteAndCompareClose(c, expected=[1.25 + len(opaque_str)])
+
+    def testCustomCallLookup(self):
+      if self.backend.platform != "cpu":
+        self.skipTest("Test requires cpu platform")
+      if xla_client._version < 241:
+        self.skipTest("Test requires jaxlib version 241")
+
+      self.assertTrue(_CUSTOM_CALLS_REGISTERED)
+      xla_client.make_cpu_client()
+      self.assertContainsSubset(
+          [
+              call.decode()
+              for call in custom_call_for_test.cpu_custom_call_targets.keys()
+          ],
+          xla_client.custom_call_targets("Host").keys(),
+      )
 
   tests.append(ComputationsWithConstantsTest)
 
@@ -510,8 +533,13 @@ def TestFactory(xla_backend,
   class LayoutsTest(ComputationTest):
     """Tests related to getting and setting on-device memory layouts."""
 
+    def _minor_to_major(self, layout: xla_client.PjRtLayout):  # pylint: disable=invalid-name
+      m2m_str = re.search("{([0-9,]*)", str(layout)).group(1)
+      if not m2m_str:
+        return ()
+      return tuple(int(x) for x in m2m_str.split(","))
+
     @unittest.skipIf(pathways, "not implemented")
-    @unittest.skipIf(pathways_ifrt, "check fails")
     def testGetArgumentLayouts(self):
       # Create computation with a few parameters.
       c = self._NewComputation()
@@ -535,12 +563,121 @@ def TestFactory(xla_backend,
       # Test that compiled executable returns plausible layouts.
       layouts: Sequence[xla_client.Layout] = executable.get_parameter_layouts()
       self.assertLen(layouts, 3)
-      self.assertLen(layouts[0].minor_to_major(), 3)
-      self.assertLen(layouts[1].minor_to_major(), 2)
-      self.assertEmpty(layouts[2].minor_to_major())
+      self.assertLen(self._minor_to_major(layouts[0]), 3)
+      self.assertLen(self._minor_to_major(layouts[1]), 2)
+      self.assertEmpty(self._minor_to_major(layouts[2]))
+
+    @unittest.skipIf(pathways, "not implemented")
+    def testGetArgumentLayoutsTupled(self):
+      # Generated with:
+      # jax.jit(lambda x, y, z: (x, y, z))(np.ones((1024, 8, 128)),
+      #                                    np.int32(42),
+      #                                    np.ones(10))
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main(
+      %arg0: tensor<1024x8x128xf32> {mhlo.sharding = "{replicated}"},
+      %arg1: tensor<i32> {mhlo.sharding = "{replicated}"},
+      %arg2: tensor<10xf32> {mhlo.sharding = "{replicated}"})
+      -> (tensor<1024x8x128xf32> {jax.result_info = "[0]"},
+          tensor<i32> {jax.result_info = "[1]"},
+          tensor<10xf32> {jax.result_info = "[2]"}) {
+    return %arg0, %arg1, %arg2 : tensor<1024x8x128xf32>, tensor<i32>, tensor<10xf32>
+  }
+}
+"""
+      options = xla_client.CompileOptions()
+      # 'parameter_is_tupled_arguments' causes MLIR untupled arguments to get
+      # turned into HLO tupled arguments.
+      options.parameter_is_tupled_arguments = True
+      executable = self.backend.compile(module_str, compile_options=options)
+
+      # Test that compiled executable returns plausible layouts.
+      layouts: Sequence[xla_client.Layout] = executable.get_parameter_layouts()
+      self.assertLen(layouts, 3)
+      self.assertLen(self._minor_to_major(layouts[0]), 3)
+      self.assertEmpty(self._minor_to_major(layouts[1]))
+      self.assertLen(self._minor_to_major(layouts[2]), 1)
+
+    @unittest.skipIf(pathways, "not implemented")
+    def testGetOutputLayouts(self):
+      # Generated with jax.jit(lambda: (np.ones((1024, 128)), np.int32(42),
+      #                                 np.ones(10)))()
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main() -> (tensor<1024x128xf32> {jax.result_info = "[0]"},
+                               tensor<i32> {jax.result_info = "[1]"},
+                               tensor<10xf32> {jax.result_info = "[2]"}) {
+    %0 = stablehlo.constant dense<1.000000e+00> : tensor<1024x128xf32>
+    %1 = stablehlo.constant dense<1.000000e+00> : tensor<10xf32>
+    %2 = stablehlo.constant dense<42> : tensor<i32>
+    return %0, %2, %1 : tensor<1024x128xf32>, tensor<i32>, tensor<10xf32>
+  }
+}
+"""
+      executable = self.backend.compile(module_str)
+
+      # Test that compiled executable returns plausible layouts.
+      layouts: Sequence[xla_client.Layout] = executable.get_output_layouts()
+      self.assertLen(layouts, 3)
+      self.assertLen(self._minor_to_major(layouts[0]), 2)
+      self.assertEmpty(self._minor_to_major(layouts[1]))
+      self.assertLen(self._minor_to_major(layouts[2]), 1)
 
     @unittest.skipIf(pathways, "not implemented")
     def testSetArgumentLayouts(self):
+      # TODO(b/309682374): implement on CPU and GPU
+      if self.backend.platform != "tpu":
+        raise self.skipTest("mhlo.layout_mode only implemented on TPU")
+
+      # Hand-edited version of:
+      # jax.jit(lambda x, y, z: (x, y, z))(np.ones((1024, 8, 128)),
+      #                                    np.int32(42),
+      #                                    np.ones(10))
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main(
+      %arg0: tensor<1024x8x128xf32> {mhlo.sharding = "{replicated}",
+                                     mhlo.layout_mode = "{0,1,2}"},
+      %arg1: tensor<i32> {mhlo.sharding = "{replicated}",
+                          mhlo.layout_mode = "{}"},
+      %arg2: tensor<10xf32> {mhlo.sharding = "{replicated}",
+                             mhlo.layout_mode = "{0}"})
+      -> (tensor<1024x8x128xf32> {jax.result_info = "[0]"},
+          tensor<i32> {jax.result_info = "[1]"},
+          tensor<10xf32> {jax.result_info = "[2]"}) {
+    return %arg0, %arg1, %arg2 : tensor<1024x8x128xf32>, tensor<i32>, tensor<10xf32>
+  }
+}
+      """
+      executable = self.backend.compile(module_str)
+
+      # Check input layouts.
+      input_layouts = executable.get_parameter_layouts()
+      self.assertLen(input_layouts, 3)
+      self.assertEqual(self._minor_to_major(input_layouts[0]), (0, 1, 2))
+      self.assertEqual(self._minor_to_major(input_layouts[1]), ())
+      self.assertEqual(self._minor_to_major(input_layouts[2]), (0,))
+
+      # Compile a version with default arg0 layout so we can make sure we
+      # actually set it above.
+      default_executable = self.backend.compile(
+          module_str.replace('"{0,1,2}"', '"default"')
+      )
+      self.assertNotEqual(
+          self._minor_to_major(input_layouts[0]),
+          self._minor_to_major(default_executable.get_parameter_layouts()[0]),
+      )
+
+    @unittest.skipIf(pathways or pathways_ifrt, "not implemented")
+    def testSetArgumentLayoutsLegacy(self):
+      """Tests setting the arg layouts with compile_options (deprecated).
+
+      New code should use the mhlo.layout_mode string attr on parameters.
+      """
       # Create computation with custom input layouts.
       c = self._NewComputation()
       param_count = 0
@@ -576,8 +713,198 @@ def TestFactory(xla_backend,
           executable.get_parameter_layouts())
       self.assertEqual(len(actual_layouts), len(expected_layouts))
       for actual, expected in zip(actual_layouts, expected_layouts):
-        self.assertEqual(actual.minor_to_major(),
-                         expected.layout().minor_to_major())
+        self.assertEqual(
+            self._minor_to_major(actual),
+            expected.layout().minor_to_major(),
+        )
+
+    @unittest.skipIf(pathways, "not implemented")
+    def testSetOutputLayouts(self):
+      # TODO(b/309682374): implement on CPU and GPU
+      if self.backend.platform != "tpu":
+        raise self.skipTest("mhlo.layout_mode only implemented on TPU")
+
+      # Hand-edited version of:
+      # jax.jit(lambda x, y, z: (x, y, z))(np.ones((1024, 8, 128)),
+      #                                    np.int32(42),
+      #                                    np.ones(10))
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main(
+      %arg0: tensor<1024x8x128xf32> {mhlo.sharding = "{replicated}"},
+      %arg1: tensor<i32> {mhlo.sharding = "{replicated}"},
+      %arg2: tensor<10xf32> {mhlo.sharding = "{replicated}"})
+      -> (tensor<1024x8x128xf32> {jax.result_info = "[0]",
+                                  mhlo.layout_mode = "{0,1,2}"},
+          tensor<i32> {jax.result_info = "[1]",
+                       mhlo.layout_mode = "{}"},
+          tensor<10xf32> {jax.result_info = "[2]",
+                          mhlo.layout_mode = "{0}"}) {
+    return %arg0, %arg1, %arg2 : tensor<1024x8x128xf32>, tensor<i32>, tensor<10xf32>
+  }
+}
+      """
+      executable = self.backend.compile(module_str)
+
+      # Check output layouts.
+      output_layouts = executable.get_output_layouts()
+      self.assertLen(output_layouts, 3)
+      self.assertEqual(self._minor_to_major(output_layouts[0]), (0, 1, 2))
+      self.assertEqual(self._minor_to_major(output_layouts[1]), ())
+      self.assertEqual(self._minor_to_major(output_layouts[2]), (0,))
+
+      # Compile a version with default first output layout so we can make sure
+      # we actually set it above.
+      default_executable = self.backend.compile(
+          module_str.replace('"{0,1,2}"', '"default"')
+      )
+      self.assertNotEqual(
+          self._minor_to_major(output_layouts[0]),
+          self._minor_to_major(default_executable.get_output_layouts()[0]),
+      )
+
+    @unittest.skipIf(pathways, "not implemented")
+    def SetLayoutsSharded(self):
+      # TODO(b/309682374): implement on CPU and GPU
+      if self.backend.platform != "tpu":
+        raise self.skipTest("mhlo.layout_mode only implemented on TPU")
+
+      # Hand-edited version of:
+      # sharding = PositionalSharding(mesh_utils.create_device_mesh((8,)))
+      # x = jax.device_put(np.ones((1024, 128)), sharding.reshape(4, 2))
+      # jax.jit(lambda x, y: x + y, out_shardings=sharding)(x, 1.)
+      #
+      # This also lightly tests mixed default + user-specified input layouts.
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 8 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main(
+      %arg0: tensor<1024x128xf32> {mhlo.sharding = "{devices=[4,2]0,1,2,3,4,5,6,7}",
+                                   mhlo.layout_mode = "{0,1}"},
+      %arg1: tensor<f32> {mhlo.sharding = "{replicated}"})
+      -> (tensor<1024x128xf32> {jax.result_info = "",
+                                mhlo.sharding = "{devices=[4,2]0,1,2,3,4,5,6,7}",
+                                mhlo.layout_mode = "{0,1}"}) {
+    %0 = stablehlo.convert %arg1 : tensor<f32>
+    %1 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f32>) -> tensor<1024x128xf32>
+    %2 = stablehlo.add %arg0, %1 : tensor<1024x128xf32>
+    return %2 : tensor<1024x128xf32>
+  }
+}
+      """
+      executable = self.backend.compile(module_str)
+
+      # Check input layouts.
+      input_layouts = executable.get_parameter_layouts()
+      self.assertLen(input_layouts, 2)
+      self.assertEqual(self._minor_to_major(input_layouts[0]), (0, 1))
+      self.assertEqual(self._minor_to_major(input_layouts[1]), ())
+
+      # Check output layout.
+      output_layouts = executable.get_output_layouts()
+      self.assertLen(output_layouts, 1)
+      self.assertEqual(self._minor_to_major(input_layouts[0]), (0, 1))
+
+      # Compile a version with default layouts so we can make sure we actually
+      # set it above.
+      default_executable = self.backend.compile(
+          module_str.replace('"{0,1}"', '"default"')
+      )
+      self.assertNotEqual(
+          self._minor_to_major(input_layouts[0]),
+          self._minor_to_major(default_executable.get_parameter_layouts()[0]),
+      )
+      self.assertNotEqual(
+          self._minor_to_major(output_layouts[0]),
+          self._minor_to_major(default_executable.get_output_layouts()[0]),
+      )
+
+    @unittest.skipIf(pathways, "not implemented")
+    def testAutoArgumentLayouts(self):
+      # TODO(b/309682374): implement on CPU and GPU
+      if self.backend.platform != "tpu":
+        raise self.skipTest("mhlo.layout_mode only implemented on TPU")
+
+      # Hand-edited version of:
+      # jax.numpy.einsum("...a,ahd->...hd", ...)
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main(
+      %arg0: tensor<1024x1024xf32> {mhlo.sharding = "{replicated}",
+                                    mhlo.layout_mode = "auto"},
+      %arg1: tensor<1024x8x128xf32> {mhlo.sharding = "{replicated}",
+                                     mhlo.layout_mode = "auto"})
+      -> (tensor<1024x8x128xf32> {jax.result_info = ""}) {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+        contracting_dims = [1] x [0],
+        precision = [DEFAULT, DEFAULT] : (tensor<1024x1024xf32>,
+                                          tensor<1024x8x128xf32>)
+        -> tensor<1024x8x128xf32>
+    return %0 : tensor<1024x8x128xf32>
+  }
+}
+"""
+      executable = self.backend.compile(module_str)
+
+      # Check input layouts.
+      input_layouts = executable.get_parameter_layouts()
+      self.assertEqual(self._minor_to_major(input_layouts[0]), (1, 0))
+      self.assertEqual(self._minor_to_major(input_layouts[1]), (2, 0, 1))
+
+      # Compile a version with default layouts so we can make sure the compiler
+      # is actually choosing above.
+      default_executable = self.backend.compile(
+          module_str.replace('"auto"', '"default"')
+      )
+      # We expect the compiler to choose a non-default layout for the second
+      # (1024,8,128) argument.
+      self.assertNotEqual(
+          self._minor_to_major(input_layouts[1]),
+          self._minor_to_major(default_executable.get_parameter_layouts()[1]),
+      )
+
+    @unittest.skipIf(pathways, "not implemented")
+    def testAutoOutputLayouts(self):
+      # TODO(b/309682374): implement on CPU and GPU
+      if self.backend.platform != "tpu":
+        raise self.skipTest("mhlo.layout_mode only implemented on TPU")
+
+      # Generated with jax.numpy.einsum("...a,ahd->...hd", ...)
+      module_str = """
+module @jit__lambda_ attributes {mhlo.num_partitions = 1 : i32,
+                                 mhlo.num_replicas = 1 : i32} {
+  func.func public @main(
+      %arg0: tensor<1024x1024xf32> {mhlo.sharding = "{replicated}"},
+      %arg1: tensor<1024x8x128xf32> {mhlo.sharding = "{replicated}"})
+      -> (tensor<1024x8x128xf32> {jax.result_info = "",
+                                  mhlo.layout_mode = "auto"}) {
+    %0 = stablehlo.dot_general %arg0, %arg1,
+        contracting_dims = [1] x [0],
+        precision = [DEFAULT, DEFAULT] : (tensor<1024x1024xf32>,
+                                          tensor<1024x8x128xf32>)
+        -> tensor<1024x8x128xf32>
+    return %0 : tensor<1024x8x128xf32>
+  }
+}
+"""
+      executable = self.backend.compile(module_str)
+
+      # Check output layout
+      output_layout, = executable.get_output_layouts()
+      self.assertEqual(self._minor_to_major(output_layout), (2, 0, 1))
+
+      # Compile a version with default layouts so we can make sure the compiler
+      # is actually choosing above.
+      default_executable = self.backend.compile(
+          module_str.replace('"auto"', '"default"')
+      )
+      # We expect the compiler to choose a non-default output layout.
+      self.assertNotEqual(
+          self._minor_to_major(output_layout),
+          self._minor_to_major(default_executable.get_output_layouts()[0]),
+      )
 
   tests.append(LayoutsTest)
 
@@ -754,7 +1081,7 @@ def TestFactory(xla_backend,
       self.assertGreaterEqual(arg1_buffer.unsafe_buffer_pointer(), 0)
       self.assertGreaterEqual(arg2_buffer.unsafe_buffer_pointer(), 0)
 
-    @unittest.skipIf(cloud_tpu or pathways, "not implemented")
+    @unittest.skipIf(cloud_tpu or pathways or pathways_ifrt, "not implemented")
     def testClone(self):
       x = np.array([[3., 4., 5.]], np.float32)
       y = self.backend.buffer_from_pyval(x)
@@ -1733,7 +2060,8 @@ def TestFactory(xla_backend,
       c = self._NewComputation()
       ops.Fft(ops.Constant(c, a), xla_client.FftType.IRFFT, [3, 4, 8])
       self._ExecuteAndCompareClose(
-          c, expected=[np.fft.irfftn(a, axes=(1, 2, 3))], rtol=1e-4)
+          c, expected=[np.fft.irfftn(a, axes=(1, 2, 3))], rtol=2e-4
+      )
 
     def testNextAfter(self):
       c = self._NewComputation()
@@ -2121,7 +2449,8 @@ def TestFactory(xla_backend,
                       false_computation)
       self._ExecuteAndCompareClose(c, expected=[1.])
 
-    @unittest.skipIf(cloud_tpu or pathways or pjrt_c_api, "not implemented")
+    @unittest.skipIf(cloud_tpu or pathways or pathways_ifrt or pjrt_c_api,
+                     "not implemented")
     def testInfeedS32Values(self):
       to_infeed = NumpyArrayS32([1, 2, 3, 4])
       c = self._NewComputation()
@@ -2141,7 +2470,8 @@ def TestFactory(xla_backend,
             compiled_c, (), backend=self.backend)
         self.assertEqual(result, item)
 
-    @unittest.skipIf(cloud_tpu or pathways or pjrt_c_api, "not implemented")
+    @unittest.skipIf(cloud_tpu or pathways or pathways_ifrt or pjrt_c_api,
+                     "not implemented")
     def testInfeedTuple(self):
       to_infeed = (NumpyArrayS32([1, 2, 3, 4]), NumpyArrayS32([[7], [8]]))
       c = self._NewComputation()
@@ -2161,7 +2491,8 @@ def TestFactory(xla_backend,
       np.testing.assert_equal(result[0], to_infeed[0])
       np.testing.assert_equal(result[1], to_infeed[1])
 
-    @unittest.skipIf(cloud_tpu or pathways or pjrt_c_api, "not implemented")
+    @unittest.skipIf(cloud_tpu or pathways or pathways_ifrt or pjrt_c_api,
+                     "not implemented")
     def testInfeedThenOutfeedS32(self):
       to_round_trip = NumpyArrayS32([1, 2, 3, 4])
       c = self._NewComputation()
@@ -2213,6 +2544,12 @@ def TestFactory(xla_backend,
     def testPlatform(self):
       for device in self.backend.local_devices():
         self.assertEqual(device.platform, self.backend.platform)
+
+    def testCoreCount(self):
+      if self.backend.platform != "gpu":
+        self.skipTest("core_count is only supported on GPU")
+      for device in self.backend.local_devices():
+        self.assertGreater(device.core_count, 0)
 
     def testLocalHardwareId(self):
       for device in self.backend.devices():
@@ -2588,12 +2925,29 @@ def TestFactory(xla_backend,
           self.assertTrue(
               re.match(r"^cuda \d{4,}$", version),
               msg=f"Expected CUDA version string; got {repr(version)}")
-      elif self.backend.platform == "tpu" and not pathways:
+      elif self.backend.platform == "tpu" and not (pathways or pathways_ifrt):
         self.assertIn("tpu", version.lower())
         self.assertIn("cl/", version)
         self.assertIn("Built on ", version)
 
-    @unittest.skipIf(cloud_tpu or pathways or tfrt_tpu, "not implemented")
+    @unittest.skipIf(
+        not cloud_tpu and not pjrt_c_api, "PJRT version only exist for plugins"
+    )
+    def testPjRtCApiVersion(self):
+      self.assertGreaterEqual(self.backend.pjrt_c_api_major_version, 0)
+      self.assertGreaterEqual(self.backend.pjrt_c_api_minor_version, 0)
+
+    @unittest.skipIf(
+        cloud_tpu or pjrt_c_api, "PJRT version only exist for plugins"
+    )
+    def testNotExistPjRtCApiVersion(self):
+      with self.assertRaises(AttributeError):
+        self.backend.pjrt_c_api_major_version  # pylint: disable=pointless-statement
+      with self.assertRaises(AttributeError):
+        self.backend.pjrt_c_api_minor_version  # pylint: disable=pointless-statement
+
+    @unittest.skipIf(cloud_tpu or pathways or pathways_ifrt or tfrt_tpu,
+                     "not implemented")
     def testExecutableSerialization(self):
       if self.backend.platform != "tpu":
         self.skipTest("Test requires tpu platform")

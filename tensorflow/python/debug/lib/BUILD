@@ -130,6 +130,7 @@ py_strict_library(
     visibility = [
         "//tensorflow:internal",
         "//third_party/py/tf_slim:__subpackages__",
+        "//waymo/ml/deploy/numeric_debugging:__subpackages__",
     ],
     deps = [
         ":debug_graphs",
@@ -475,7 +476,7 @@ py_strict_test(
         "//tensorflow/python/ops:variables",
         "//tensorflow/python/ops:while_loop",
         "//tensorflow/python/platform:test",
-        "//tensorflow/python/util:tf_decorator",
+        "//tensorflow/python/util:tf_inspect",
         "//third_party/py/numpy",
     ],
 )
@@ -503,7 +504,7 @@ py_strict_test(
         "//tensorflow/python/ops:variables",
         "//tensorflow/python/platform:client_testlib",
         "//tensorflow/python/platform:test",
-        "//tensorflow/python/util:tf_decorator",
+        "//tensorflow/python/util:tf_inspect",
     ],
 )
 

@@ -92,12 +92,12 @@ module @jit_f.0 {
 
     self._assertOpOutputMatchesExpected(f, (x,), (np.sin(np.cos(x)),))
 
-  def test_basic_with_token(self):
+  def test_basic_with_token_v8(self):
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
 
     def f(x):
       # sin(cos(x))
-      module, version = serialize("""
+      module, _ = serialize("""
 module @jit_f.0 {
   func.func public @main(%arg0: !stablehlo.token, %arg1: tensor<3xf32>) -> (!stablehlo.token, tensor<3xf32>) {
     %0 = stablehlo.cosine %arg1 : tensor<3xf32>
@@ -108,11 +108,61 @@ module @jit_f.0 {
 """)
       return xla.call_module(
           [x],
+          version=8,  # Version 8 uses only one prefix token
+          module=module,
+          Tout=[x.dtype],
+          Sout=[x.shape],
+          has_token_input_output=True,  # Version 8 cares about this
+          platforms=[self.testing_platform()],
+      )
+
+    self._assertOpOutputMatchesExpected(f, (x,), (np.sin(np.cos(x)),))
+
+  def test_basic_with_multiple_tokens(self):
+    x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+    def f(x):
+      # sin(cos(x))
+      module, version = serialize("""
+module @jit_f.0 {
+  func.func public @main(%arg0: !stablehlo.token {jax.token = true}, %arg1: !stablehlo.token {jax.token = true}, %arg2: tensor<3xf32>) -> (!stablehlo.token, !stablehlo.token, tensor<3xf32>) {
+    %0 = stablehlo.cosine %arg2 : tensor<3xf32>
+    %1 = stablehlo.sine %0 : tensor<3xf32>
+    return %arg0, %arg1, %1 : !stablehlo.token, !stablehlo.token, tensor<3xf32>
+  }
+}
+""")
+      return xla.call_module(
+          [x],
           version=version,
           module=module,
           Tout=[x.dtype],
           Sout=[x.shape],
-          has_token_input_output=True,
+          platforms=[self.testing_platform()],
+      )
+
+    self._assertOpOutputMatchesExpected(f, (x,), (np.sin(np.cos(x)),))
+
+  def test_basic_with_tokens_preceeded_by_other_args(self):
+    x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+    def f(x):
+      # sin(cos(x))
+      module, version = serialize("""
+module @jit_f.0 {
+  func.func public @main(%arg0: tensor<i32>, %arg1: !stablehlo.token {jax.token = true}, %arg2: !stablehlo.token {jax.token = true}, %arg3: tensor<3xf32>) -> (!stablehlo.token, !stablehlo.token, tensor<3xf32>) {
+    %0 = stablehlo.cosine %arg3 : tensor<3xf32>
+    %1 = stablehlo.sine %0 : tensor<3xf32>
+    return %arg1, %arg2, %1 : !stablehlo.token, !stablehlo.token, tensor<3xf32>
+  }
+}
+""")
+      return xla.call_module(
+          [np.int32(0), x],
+          version=version,
+          module=module,
+          Tout=[x.dtype],
+          Sout=[x.shape],
           platforms=[self.testing_platform()],
       )
 
@@ -183,7 +233,7 @@ module @jit_f.0 attributes {{jax.uses_shape_polymorphism = true}} {{
     %0, %1 = call @dyn_main(%arg0_new, %arg1) : (tensor<{dim_var_type}>, tensor<2x?xf32>) -> (tensor<2x?xf32>, tensor<{dim_var_type}>)
     return %0, %1 : tensor<2x?xf32>, tensor<{dim_var_type}>
   }}
-  func.func private @dyn_main(%arg0: tensor<{dim_var_type}>, %arg1: tensor<2x?xf32>) -> (tensor<2x?xf32>, tensor<{dim_var_type}>) {{
+  func.func private @dyn_main(%arg0: tensor<{dim_var_type}> {{jax.global_constant = "b"}}, %arg1: tensor<2x?xf32>) -> (tensor<2x?xf32>, tensor<{dim_var_type}>) {{
     %0 = stablehlo.sine %arg1 : tensor<2x?xf32>
     return %0, %arg0 : tensor<2x?xf32>, tensor<{dim_var_type}>
   }}
@@ -196,27 +246,6 @@ module @jit_f.0 attributes {{jax.uses_shape_polymorphism = true}} {{
                              platforms=[self.testing_platform()],)
 
     self._assertOpOutputMatchesExpected(f, (x,), (np.sin(x), x.shape[1]))
-
-  def test_poly_unranked(self):
-    x = np.arange(6, dtype=np.float32).reshape((2, 3))
-
-    def f(x):  # x: f32[2, b]
-      # sin(x)
-      module, version = serialize("""
-module @jit_f.0 attributes {jax.uses_shape_polymorphism = true} {
-  func.func public @main(%arg1: tensor<*xf32>) -> tensor<*xf32> {
-    %0 = stablehlo.sine %arg1 : tensor<*xf32>
-    return %0 : tensor<*xf32>
-  }
-}
-""")
-      return xla.call_module([x],
-                             module=module, version=version,
-                             Tout=[x.dtype],
-                             Sout=[(None, None),],
-                             platforms=[self.testing_platform()],)
-
-    self._assertOpOutputMatchesExpected(f, (x,), (np.sin(x),))
 
   def test_wrong_actual_args_errors(self):
     x = np.arange(6, dtype=np.float32).reshape((3, 2))
@@ -278,7 +307,7 @@ module @jit_f.0 attributes {jax.uses_shape_polymorphism = true} {
     #  returns x + 2. on CPU, x + 3. on GPU (CUDA or ROCM) and x + 4. on TPU
     module, version = serialize(f"""
 module @jit_f.0 {{
-  func.func public @main(%arg_platform_idx: tensor<{platform_idx_type}>, %arg0: tensor<f32>) -> tensor<f32> {{
+  func.func public @main(%arg_platform_idx: tensor<{platform_idx_type}> {{jax.global_constant = "_platform_index"}}, %arg0: tensor<f32>) -> tensor<f32> {{
     %0 = stablehlo.convert %arg_platform_idx : (tensor<{platform_idx_type}>) -> tensor<i32>
     %to_add = "stablehlo.case"(%0) ({{
       %cpu_val = stablehlo.constant dense<2.> : tensor<f32>
@@ -319,7 +348,7 @@ module @jit_f.0 {{
     #  returns x + 2. on CPU, x + 3. on GPU, and x + 4. on TPU
     module, version = serialize("""
 module @jit_f.0 {
-  func.func public @main(%arg_platform_idx: tensor<i32>, %arg0: tensor<f32>) -> tensor<f32> {
+  func.func public @main(%arg_platform_idx: tensor<i32> {jax.global_constant = "_platform_index"}, %arg0: tensor<f32>) -> tensor<f32> {
     %to_add = "stablehlo.case"(%arg_platform_idx) ({
       %cpu_val = stablehlo.constant dense<2.> : tensor<f32>
       stablehlo.return %cpu_val : tensor<f32>
@@ -358,13 +387,13 @@ module @jit_f.0 {
 
     module, version = serialize("""
 module @jit_f_jax attributes {jax.uses_shape_polymorphism = true} {
-  func.func public @main(%arg_platform_idx: tensor<i32>, %arg0: tensor<?xf32>) -> (tensor<?xf32>) {
+  func.func public @main(%arg_platform_idx: tensor<i32> {jax.global_constant = "_platform_index"}, %arg0: tensor<?xf32>) -> (tensor<?xf32>) {
     %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf32>) -> tensor<i32>
     %5 = call @_wrapped_jax_export_main(%arg_platform_idx, %0, %arg0) : (tensor<i32>, tensor<i32>, tensor<?xf32>) -> tensor<?xf32>
     return %5 : tensor<?xf32>
   }
 
-  func.func private @_wrapped_jax_export_main(%arg_platform_idx: tensor<i32>, %arg0: tensor<i32>, %arg1: tensor<?xf32>) -> (tensor<?xf32>) {
+  func.func private @_wrapped_jax_export_main(%arg_platform_idx: tensor<i32> {jax.global_constant = "_platform_index"}, %arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?xf32>) -> (tensor<?xf32>) {
     %to_add = "stablehlo.case"(%arg_platform_idx) ({
       %cpu_val = stablehlo.constant dense<2.> : tensor<f32>
       stablehlo.return %cpu_val : tensor<f32>
@@ -379,6 +408,49 @@ module @jit_f_jax attributes {jax.uses_shape_polymorphism = true} {
     %3 = stablehlo.dynamic_broadcast_in_dim %to_add, %1, dims = [] : (tensor<f32>, tensor<1xi32>) -> tensor<?xf32>
     %4 = stablehlo.add %3, %arg1 : tensor<?xf32>
     return %4 : tensor<?xf32>
+  }
+}
+""")
+    platforms = ['CPU', 'CUDA', 'ROCM', 'TPU']
+    def f(x):
+      return xla.call_module([x], version=version,
+                             module=module,
+                             Tout=[np.float32],
+                             Sout=[()],
+                             platforms=platforms)
+
+    expected_value = (
+        x + dict(CPU=2.0, CUDA=3.0, ROCM=3.0, TPU=4.0)[self.testing_platform()]
+    )
+    self._assertOpOutputMatchesExpected(f, (x,), (expected_value,))
+
+  def test_platforms_and_poly_and_tokens(self):
+    x = np.arange(6, dtype=np.float32)
+    #  returns x + 2. on CPU, x + 3. on GPU (CUDA or ROCM) and x + 4. on TPU
+
+    module, version = serialize("""
+module @jit_f_jax attributes {jax.uses_shape_polymorphism = true} {
+  func.func public @main(%arg_platform_idx: tensor<i32> {jax.global_constant = "_platform_index"}, %arg_tok: !stablehlo.token {jax.token = true}, %arg0: tensor<?xf32>) -> (!stablehlo.token, tensor<?xf32>) {
+    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf32>) -> tensor<i32>
+    %5:2 = call @_wrapped_jax_export_main(%arg_platform_idx, %0, %arg_tok, %arg0) : (tensor<i32>, tensor<i32>, !stablehlo.token, tensor<?xf32>) -> (!stablehlo.token, tensor<?xf32>)
+    return %5#0, %5#1 : !stablehlo.token, tensor<?xf32>
+  }
+
+  func.func private @_wrapped_jax_export_main(%arg_platform_idx: tensor<i32> {jax.global_constant = "_platform_index"}, %arg0: tensor<i32> {jax.global_constant = "b"}, %arg_tok: !stablehlo.token {jax.token = true}, %arg1: tensor<?xf32>) -> (!stablehlo.token, tensor<?xf32>) {
+    %to_add = "stablehlo.case"(%arg_platform_idx) ({
+      %cpu_val = stablehlo.constant dense<2.> : tensor<f32>
+      stablehlo.return %cpu_val : tensor<f32>
+    }, {
+      %gpu_val = stablehlo.constant dense<3.> : tensor<f32>
+      stablehlo.return %gpu_val : tensor<f32>
+    }, {
+      %tpu_val = stablehlo.constant dense<4.> : tensor<f32>
+      stablehlo.return %tpu_val : tensor<f32>
+    }) : (tensor<i32>) -> tensor<f32>
+    %1 = stablehlo.reshape %arg0 : (tensor<i32>) -> tensor<1xi32>
+    %3 = stablehlo.dynamic_broadcast_in_dim %to_add, %1, dims = [] : (tensor<f32>, tensor<1xi32>) -> tensor<?xf32>
+    %4 = stablehlo.add %3, %arg1 : tensor<?xf32>
+    return %arg_tok, %4 : !stablehlo.token, tensor<?xf32>
   }
 }
 """)
@@ -742,7 +814,7 @@ module @jit_fun.1 attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?x5xi32>) -> tensor<?xi32>
     return %0 : tensor<?xi32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x5xi32>) -> tensor<?xi32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x5xi32>) -> tensor<?xi32> {
     %0 = stablehlo.reshape %arg0 : (tensor<i32>) -> tensor<1xi32>
     %1 = "stablehlo.dynamic_iota"(%0) {iota_dimension = 0 : i64} : (tensor<1xi32>) -> tensor<?xi32>
     return %1 : tensor<?xi32>
@@ -768,7 +840,7 @@ module @jit_f.0 {
   }
 }
 """)
-    platforms = ['TPU']  # the module is compileable only on TPU
+    platforms = ['TPU']  # the module is compilable only on TPU
     def f(x):
       return xla.call_module([x], version=version,
                              module=module,
@@ -790,7 +862,7 @@ module @jit_fun_flat_jax attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?x3xf32>) -> tensor<?xf32>
     return %0 : tensor<?xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x3xf32>) -> tensor<?xf32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x3xf32>) -> tensor<?xf32> {
     %0 = stablehlo.constant dense<3> : tensor<i32>
     %1 = stablehlo.multiply %arg0, %0 : tensor<i32>
     %2 = stablehlo.reshape %1 : (tensor<i32>) -> tensor<1xi32>
@@ -819,7 +891,7 @@ module @jit_fun_flat_jax attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?x4xf32>) -> tensor<?x2xf32>
     return %0 : tensor<?x2xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x4xf32>) -> tensor<?x2xf32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x4xf32>) -> tensor<?x2xf32> {
     %0 = stablehlo.constant dense<0> : tensor<i64>
     %1 = stablehlo.constant dense<0> : tensor<1xi64>
     %2 = stablehlo.reshape %arg0 : (tensor<i32>) -> tensor<1xi32>
@@ -850,7 +922,7 @@ module @jit_fun_flat_jax attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?x4xf32>) -> tensor<4xf32>
     return %0 : tensor<4xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x4xf32>) -> tensor<4xf32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x4xf32>) -> tensor<4xf32> {
     %0 = stablehlo.constant dense<-1> : tensor<i32>
     %1 = stablehlo.add %arg0, %0 : tensor<i32>
     %2 = stablehlo.reshape %1 : (tensor<i32>) -> tensor<1xi32>
@@ -887,7 +959,7 @@ module @jit_fun_flat_jax attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1, %arg2) : (tensor<i32>, tensor<?x4xf32>, tensor<i32>) -> tensor<?x4xf32>
     return %0 : tensor<?x4xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x4xf32>, %arg2: tensor<i32>) -> tensor<?x4xf32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x4xf32>, %arg2: tensor<i32>) -> tensor<?x4xf32> {
     %0 = stablehlo.constant dense<0> : tensor<i32>
     %1 = stablehlo.compare  LT, %arg2, %0,  SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
     %2 = stablehlo.add %arg2, %arg0 : tensor<i32>
@@ -920,12 +992,12 @@ module @jit_fun.0 attributes {jax.uses_shape_polymorphism = true} {
     %0, %1 = call @dyn_main(%arg0_new, %arg1, %arg2) : (tensor<i32>, tensor<?x4xf32>, tensor<2x?x4xf32>) -> (tensor<2x?x4xf32>, tensor<2x?x4xf32>)
     return %0, %1 : tensor<2x?x4xf32>, tensor<2x?x4xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x4xf32>, %arg2: tensor<2x?x4xf32>) -> (tensor<2x?x4xf32>, tensor<2x?x4xf32>) {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x4xf32>, %arg2: tensor<2x?x4xf32>) -> (tensor<2x?x4xf32>, tensor<2x?x4xf32>) {
     %0 = stablehlo.constant dense<2> : tensor<1xi32>
     %2 = stablehlo.reshape %arg0 : (tensor<i32>) -> tensor<1xi32>
     %3 = stablehlo.constant dense<4> : tensor<1xi32>
     %4 = "stablehlo.concatenate"(%0, %2, %3) {dimension = 0 : i64} : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
-    %5 = "stablehlo.dynamic_broadcast_in_dim"(%arg1, %4) {broadcast_dimensions = dense<[1, 2]> : tensor<2xi64>} : (tensor<?x4xf32>, tensor<3xi32>) -> tensor<2x?x4xf32>
+    %5 = "stablehlo.dynamic_broadcast_in_dim"(%arg1, %4) {broadcast_dimensions = array<i64: 1, 2>} : (tensor<?x4xf32>, tensor<3xi32>) -> tensor<2x?x4xf32>
     %6 = stablehlo.add %5, %arg2 : (tensor<2x?x4xf32>, tensor<2x?x4xf32>) -> tensor<2x?x4xf32>
     return %5, %6 : tensor<2x?x4xf32>, tensor<2x?x4xf32>
   }
@@ -952,7 +1024,7 @@ module @jit_fun attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?xi32>) -> tensor<i32>
     return %0 : tensor<i32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?xi32>) -> tensor<i32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?xi32>) -> tensor<i32> {
     %0 = stablehlo.constant dense<0> : tensor<i32>
     %1 = stablehlo.reduce(%arg1 init: %0) across dimensions = [0] : (tensor<?xi32>, tensor<i32>) -> tensor<i32>
      reducer(%arg2: tensor<i32>, %arg3: tensor<i32>)  {
@@ -984,7 +1056,7 @@ module @jit_fun_flat_jax attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?x5xf32>) -> tensor<?x1xf32>
     return %0 : tensor<?x1xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?x5xf32>) -> tensor<?x1xf32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?x5xf32>) -> tensor<?x1xf32> {
     %0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %1 = stablehlo.reduce(%arg1 init: %0) across dimensions = [1] : (tensor<?x5xf32>, tensor<f32>) -> tensor<?xf32>
      reducer(%arg2: tensor<f32>, %arg3: tensor<f32>)  {
@@ -1020,11 +1092,11 @@ module @jit_fun_3 attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?xf32>) -> tensor<?xi32>
     return %0 : tensor<?xi32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?xf32>) -> tensor<?xi32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?xf32>) -> tensor<?xi32> {
     %0 = call @f(%arg0, %arg1) : (tensor<i32>, tensor<?xf32>) -> tensor<?xi32>
     return %0 : tensor<?xi32>
   }
-  func.func private @f(%arg0: tensor<i32>, %arg1: tensor<?xf32>) -> tensor<?xi32> {
+  func.func private @f(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?xf32>) -> tensor<?xi32> {
     %0 = stablehlo.reshape %arg0 : (tensor<i32>) -> tensor<1xi32>
     %1 = "stablehlo.dynamic_iota"(%0) {iota_dimension = 0 : i64} : (tensor<1xi32>) -> tensor<?xi32>
     return %1 : tensor<?xi32>
@@ -1051,7 +1123,7 @@ module @jit_fun_3 attributes {jax.uses_shape_polymorphism = true} {
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?xf32>) -> tensor<?xf32>
     return %0 : tensor<?xf32>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?xf32>) -> tensor<?xf32> {
     return %arg1 : tensor<?xf32>
   }
 }
@@ -1067,7 +1139,7 @@ module @jit_fun_3 attributes {jax.uses_shape_polymorphism = true} {
   def test_while(self):
     """A while loop with carryied dynamic shapes."""
     x = np.ones((5,), dtype=np.float32)
-    # Compute the result in Pyton first
+    # Compute the result in Python first
     res0 = np.copy(x)
     for _ in range(5):
       res0 += np.arange(x.shape[0], dtype=np.float32)
@@ -1081,7 +1153,7 @@ module @jit_fun_flat_jax attributes {jax.uses_shape_polymorphism = true} {
     %0, %1 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?xf32>) -> (tensor<?xf32>, tensor<i64>)
     return %0, %1 : tensor<?xf32>, tensor<i64>
   }
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?xf32>) -> (tensor<?xf32>, tensor<i64>) {
+  func.func private @dyn_main(%arg0: tensor<i32> {jax.global_constant = "b"}, %arg1: tensor<?xf32>) -> (tensor<?xf32>, tensor<i64>) {
     %0 = stablehlo.constant dense<0> : tensor<i64>
     %1:2 = "stablehlo.while"(%arg1, %0) ({
     ^bb0(%arg2: tensor<?xf32>, %arg3: tensor<i64>):
@@ -1123,7 +1195,7 @@ module @jit_fun_3 {module_attrs} {{
     %0 = call @dyn_main(%arg0_new, %arg1) : (tensor<i32>, tensor<?xf32>) -> tensor<?xf32>
     return %0 : tensor<?xf32>
   }}
-  func.func private @dyn_main(%arg0: tensor<i32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {{
+  func.func private @dyn_main(%arg0: tensor<i32> {{jax.global_constant = "b"}}, %arg1: tensor<?xf32>) -> tensor<?xf32> {{
     return %arg1 : tensor<?xf32>
   }}
 }}
@@ -1311,7 +1383,6 @@ module @jit_fun_flat_jax {
           Sout=[res.shape],
           platforms=[self.testing_platform()],
           function_list=(foo,),
-          has_token_input_output=True,
       )
 
     self._assertOpOutputMatchesExpected(f, (x, y), (res,))
@@ -1463,7 +1534,7 @@ module @jit_fun_flat_jax {
     self._assertOpOutputMatchesExpected(f, (x, y), (res0, res1))
 
   def test_op_backward_compatibility(self):
-    """Test for ensuring XlaCallModuleOp backward compatiblity."""
+    """Test for ensuring XlaCallModuleOp backward compatibility."""
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
 
     def f(x):
